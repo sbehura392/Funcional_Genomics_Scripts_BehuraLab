@@ -1,3 +1,4 @@
+https://doi.org/10.5281/zenodo.19104906
 # Funcional_Genomics_Scripts_BehuraLab
 Functional genomics pipelines from Behura Lab
 
