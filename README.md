@@ -1,5 +1,5 @@
 https://doi.org/10.5281/zenodo.19104906
-# Funcional_Genomics_Scripts_BehuraLab
+# FUNCTIONAL_GENOMICS_SCRIPTS_BEHURALAB
 Functional genomics pipelines from Behura Lab
 
 A comprehensive collection of bioinformatics, functional genomics, and computational biology pipelines developed by **Susanta Behura Lab** for analyzing multi-omics data across diverse biological systems, with a strong focus on poultry health, development, and disease.
