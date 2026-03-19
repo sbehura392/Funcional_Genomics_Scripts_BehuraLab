@@ -1,0 +1,243 @@
+# =============================================================================
+# Pipeline: Metagenomics-Based Bacterial Profiling and Variant Association
+# Author: Susanta Behura
+#
+# Description:
+# This pipeline analyzes chicken gut metagenomic sequence data to:
+#   1) Classify bacterial taxa using Kraken2/Bracken
+#   2) Estimate microbial diversity
+#   3) Map reads to bacterial reference genomes
+#   4) Identify bacterial genetic variants
+#   5) Test associations between bacterial variants and host trait groups
+#      (Eimeria-susceptible vs Eimeria-resistant chickens)
+#
+# Requirements:
+# - Kraken2
+# - Bracken
+# - KrakenTools
+# - bwa-mem2
+# - samtools
+# - picard
+# - sambamba
+# - bcftools
+# - tabix
+#
+# Input:
+# - Paired-end metagenomic FASTQ files
+# - Concatenated bacterial reference genomes
+# - Sample renaming file
+#
+# Output:
+# - Taxonomic classification reports
+# - Bracken abundance estimates
+# - Alpha/beta diversity summaries
+# - Variant call files (VCF)
+# - Trait-associated bacterial SNPs (BED format)
+# =============================================================================
+
+
+# =============================================================================
+# STEP 1: Build a Custom Kraken2 Database for Bacteria
+# =============================================================================
+
+module load krakentools
+
+kraken2-build --download-library bacteria --db db_bacteria
+
+
+# =============================================================================
+# STEP 2: Taxonomic Classification of Paired-End Metagenomic Reads
+# =============================================================================
+
+for i in $(ls *_1.fastq.gz | sed 's/_1.fastq.gz//g'); do
+    kraken2 \
+        --db db_bacteria \
+        --threads 16 \
+        --paired \
+        --classified-out ${i}_classified_reads#.fastq.gz \
+        --output ${i}_kraken_results_bacteria.txt \
+        --report ${i}_kraken_report_bacteria.txt \
+        --use-names \
+        ${i}_1.fastq.gz ${i}_2.fastq.gz
+done
+
+
+# =============================================================================
+# STEP 3: Estimate Taxon Abundance with Bracken
+# =============================================================================
+
+for i in $(ls *_kraken_report_bacteria.txt); do
+    bracken \
+        -d db_bacteria \
+        -i "$i" \
+        -o "${i}_bracken_results" \
+        -w "${i}_bracken_report"
+done
+
+
+# =============================================================================
+# STEP 4: Compute Microbial Diversity Metrics
+# =============================================================================
+
+module load krakentools
+
+# Alpha diversity (Shannon index)
+for i in $(ls *_bracken_results); do
+    alpha_diversity.py \
+        -f "$i" \
+        -a Sh \
+        > "${i}_alpha_diversity_shannon.txt"
+done
+
+# Beta diversity
+beta_diversity.py \
+    -i *_bracken_results \
+    --type bracken \
+    > output_distance_matrix.txt
+
+# Generate Krona input files
+for i in $(ls *_bracken_report); do
+    kreport2krona.py \
+        -r "$i" \
+        -o "${i}_krona.txt" \
+        --no-intermediate-ranks
+done
+
+
+# =============================================================================
+# STEP 5: Map Reads to Concatenated Bacterial Reference Genomes
+# =============================================================================
+
+# Assumes the concatenated bacterial genome reference has already been indexed
+# with bwa-mem2 and is available as: all_bacteria_genomes_bwa_mem2
+
+module load bwa-mem2/2.2.1
+module load samtools
+
+for f in $(ls *_1.fastq.gz | sed 's/_1.fastq.gz//g'); do
+    bwa-mem2 mem all_bacteria_genomes_bwa_mem2 \
+        -t 8 \
+        -M \
+        -R "@RG\tID:${f}\tLB:${f}\tPL:ILLUMINA\tPM:NOVASEQ\tSM:${f}" \
+        ${f}_1.fastq.gz ${f}_2.fastq.gz | \
+    samtools view -@ 8 -bS -o ${f}.bam -
+done
+
+
+# =============================================================================
+# STEP 6: Sort BAM Files, Mark Duplicates, and Index Alignments
+# =============================================================================
+
+module load picard
+module load sambamba
+module load samtools
+
+# Sort BAM files
+for f in $(ls *.bam | sed 's/.bam//g'); do
+    sambamba sort -t 12 ${f}.bam -o ${f}.sorted.bam
+done
+
+# Mark duplicate reads
+for f in $(ls *.sorted.bam | sed 's/.sorted.bam//g'); do
+    picard MarkDuplicates \
+        I=${f}.sorted.bam \
+        O=${f}.dedup.bam \
+        M=${f}.dedup.metrics.txt
+done
+
+# Index deduplicated BAM files
+for f in $(ls *.dedup.bam); do
+    sambamba index -t 12 ${f}
+done
+
+
+# =============================================================================
+# STEP 7: Call Genetic Variants from Mapped Metagenomic Reads
+# =============================================================================
+
+module load bcftools
+
+for f in $(ls *.dedup.bam | sed 's/.dedup.bam//g'); do
+    bcftools mpileup \
+        -f ../genomes.fa \
+        --annotate FORMAT/AD \
+        ${f}.dedup.bam | \
+    bcftools call \
+        -mv \
+        -O z \
+        -o ${f}_variants.vcf.gz
+done
+
+
+# =============================================================================
+# STEP 8: Merge Variant Calls Across Samples
+# =============================================================================
+
+# Index VCF files before merging
+for v in $(ls *_variants.vcf.gz); do
+    tabix -p vcf "$v"
+done
+
+bcftools merge \
+    -m none \
+    -O z \
+    -o merged_common.vcf.gz \
+    *.vcf.gz
+
+
+# =============================================================================
+# STEP 9: Rename Samples for Downstream Interpretation
+# =============================================================================
+
+bcftools reheader \
+    -s samples_actual_names.txt \
+    merged_common.vcf.gz \
+    > renamed.vcf.gz
+
+tabix -p vcf renamed.vcf.gz
+
+
+# =============================================================================
+# STEP 10: Define Trait Groups
+# =============================================================================
+
+# Group samples according to Eimeria susceptibility/resistance labels
+bcftools query -l renamed.vcf.gz | grep "JS" > susceptible.txt
+bcftools query -l renamed.vcf.gz | grep "JR" > resistant.txt
+
+
+# =============================================================================
+# STEP 11: Perform Allele Frequency Contrast Analysis
+# =============================================================================
+
+bcftools +contrast \
+    -0 susceptible.txt \
+    -1 resistant.txt \
+    renamed.vcf.gz \
+    -o association_results.vcf.gz \
+    -Oz
+
+
+# =============================================================================
+# STEP 12: Extract Trait-Associated SNPs
+# =============================================================================
+
+zgrep -v "^##" association_results.vcf.gz | \
+    grep "PASSOC=0.1" > association_snps.txt
+
+awk -v OFS="\t" '{
+    print $1, $2, $2, $1":"$2"_"$4"/"$5
+}' association_snps.txt | \
+    sort -k1,1 -k2,2n > trait_biased_SNPs.bed
+
+
+# =============================================================================
+# NOTES:
+# =============================================================================
+# - Kraken2/Bracken provides taxonomic profiling and abundance estimation
+# - Diversity analyses summarize community-level microbial variation
+# - Variant calling is restricted to reads mapping to bacterial references
+# - PASSOC thresholds should be reviewed carefully based on study design
+# - Additional filtering by depth, quality, and prevalence is recommended
+#   before biological interpretation
+# =============================================================================

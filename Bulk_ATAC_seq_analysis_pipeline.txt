@@ -1,0 +1,131 @@
+###############################################################################
+# Bulk ATAC-seq Peak Calling Pipeline Using MACS2
+#
+# Description:
+# This pipeline processes bulk ATAC-seq data to identify open chromatin
+# regions. The workflow includes:
+#   - Raw read quality trimming
+#   - Reference genome indexing
+#   - Read alignment
+#   - BAM sorting and indexing
+#   - Duplicate marking and removal
+#   - Peak calling with MACS2
+#
+# Input:
+#   - Paired-end FASTQ files:
+#       seq_1.fastq.gz
+#       seq_2.fastq.gz
+#
+# Output:
+#   - Deduplicated BAM file
+#   - Peak calls representing accessible chromatin regions
+#
+# Requirements:
+#   - Trim Galore
+#   - Bowtie2
+#   - samtools
+#   - Picard
+#   - MACS2
+#
+###############################################################################
+
+
+###############################################################################
+# Step 1: Perform Quality Control and Adapter Trimming
+###############################################################################
+
+module load trimgalore
+
+# Trim adapters and low-quality bases from paired-end reads
+trim_galore --paired seq_1.fastq.gz seq_2.fastq.gz --illumina
+
+
+###############################################################################
+# Step 2: Build Reference Genome Index
+###############################################################################
+
+module load bowtie2
+
+# Build Bowtie2 index from reference genome FASTA
+bowtie2-build genome.fa index
+
+
+###############################################################################
+# Step 3: Align Reads to the Reference Genome
+###############################################################################
+
+# Align trimmed paired-end reads
+bowtie2 --threads 8 \
+  -x index \
+  -q \
+  -1 seq_val_1.fq.gz \
+  -2 seq_val_2.fq.gz \
+  -S seq.sam
+
+
+###############################################################################
+# Step 4: Convert SAM to Sorted BAM
+###############################################################################
+
+module load samtools
+
+# Convert SAM to BAM and sort alignments
+samtools view --threads 7 -bS seq.sam | \
+samtools sort --threads 7 - > seq.sorted.bam
+
+# Index sorted BAM file
+samtools index seq.sorted.bam
+
+
+###############################################################################
+# Step 5: Mark Duplicate Reads
+###############################################################################
+
+module load picard
+
+# Mark PCR duplicates while retaining all reads
+picard MarkDuplicates \
+  QUIET=true \
+  INPUT=seq.sorted.bam \
+  OUTPUT=seq.marked.bam \
+  METRICS_FILE=seq.sorted.metrics \
+  REMOVE_DUPLICATES=false \
+  CREATE_INDEX=true \
+  VALIDATION_STRINGENCY=LENIENT \
+  TMP_DIR=/tmp
+
+
+###############################################################################
+# Step 6: Remove Duplicate Reads
+###############################################################################
+
+# Remove reads flagged as duplicates (SAM flag 1024)
+samtools view -h -b -F 1024 seq.marked.bam > seq_rmDup.bam
+
+
+###############################################################################
+# Step 7: Call Open Chromatin Peaks
+###############################################################################
+
+# Call peaks using MACS2
+# Notes:
+#   - BAMPE indicates paired-end BAM input
+#   - --broad is used for broad accessible regions
+#   - -B generates signal tracks
+macs2 callpeak \
+  -t seq_rmDup.bam \
+  -q 0.05 \
+  --broad \
+  -f BAMPE \
+  -n seq \
+  -B \
+  --trackline
+
+
+###############################################################################
+# Final Output:
+#   seq_rmDup.bam         → Deduplicated alignment file
+#   seq_peaks.*           → MACS2 peak output files
+#   seq.sorted.metrics    → Duplicate metrics from Picard
+#
+###############################################################################

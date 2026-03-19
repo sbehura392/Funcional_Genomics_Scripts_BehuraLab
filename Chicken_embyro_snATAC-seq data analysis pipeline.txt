@@ -1,0 +1,279 @@
+###############################################################################
+# snATAC-seq Analysis Pipeline for Avian Embryonic Brain (Chicken & Turkey)
+#
+# Description:
+# This pipeline analyzes single-nucleus ATAC-seq (snATAC-seq) data from
+# chicken and turkey embryonic brain to:
+#   - Identify open chromatin regions
+#   - Perform transcription factor (TF) motif analysis
+#   - Associate regulatory elements with genes
+#   - Identify candidate regulatory networks in developing brain cells
+#
+# Downstream integration includes:
+#   - Validation using bulk RNA-seq expression data
+#   - Cross-species comparison with:
+#       • Chicken chorioallantoic membrane (CAM)
+#       • Mouse placenta (functional analog of CAM)
+#
+# Reference:
+# Behura SK (2025). Comparative analysis of single-cell open chromatin in
+# embryonic brain between chicken and turkey.
+# Journal of Animal Science, 103 (Supplement_3), 84–85.
+#
+###############################################################################
+
+
+###############################################################################
+# Step 1: Load Cell Ranger ATAC and Prepare Reference Genome
+###############################################################################
+
+module load cellranger-atac/cellranger-atac-2.0.0
+
+# Download transcription factor motif database (JASPAR)
+wget --no-check-certificate \
+https://jaspar.genereg.net/download/data/2022/CORE/JASPAR2022_CORE_vertebrates_non-redundant_pfms_jaspar.txt  
+
+# Format motif headers for compatibility
+sed 's/\t/_/g' \
+JASPAR2022_CORE_vertebrates_non-redundant_pfms_jaspar.txt \
+> motifs_header_changed.pfm
+
+
+# Example genome configuration file (chick_genome.config)
+# Includes genome FASTA, GTF annotation, and motif file
+
+# Build reference genome
+cellranger-atac mkref --config=chick_genome.config
+
+
+###############################################################################
+# Step 2: Align Reads and Generate Peak Counts
+###############################################################################
+
+# Perform read alignment and peak calling
+cellranger-atac count \
+  --id=chicken \
+  --reference=GRCg7b \
+  --fastqs=. \
+  --sample=chicken
+
+# Output:
+#   'outs/' directory contains:
+#     - Peak matrix
+#     - Clustering results
+#     - Dimensionality reduction coordinates
+
+
+###############################################################################
+# Step 3: Load and Visualize Clustering Results (R)
+###############################################################################
+
+# Load t-SNE projection
+pr <- read.csv("outs/analysis/tsne/2_components/projection.csv")
+
+# Load cluster assignments
+cl <- read.csv("outs/analysis/clustering/graphclust/clusters.csv")
+
+# Merge datasets using cell barcodes
+d <- merge(pr, cl, by = "Barcode")
+
+# Visualization
+library(ggplot2)
+
+ggplot(d, aes(x = TSNE.1, y = TSNE.2, color = factor(Cluster))) +
+  geom_point(size = 0.2) +
+  labs(title = "Chicken Embryonic Brain snATAC-seq",
+       x = "tSNE1", y = "tSNE2", color = "Cluster") +
+  theme_bw() +
+  theme(legend.position = "right",
+        plot.title = element_text(hjust = 0.5),
+        text = element_text(size = 14),
+        panel.border = element_blank(),
+        axis.line = element_line()) +
+  guides(color = guide_legend(ncol = 2))
+
+
+###############################################################################
+# Step 4: Cell Type Assignment
+###############################################################################
+
+# Strategy:
+#   1. Extract differential peaks per cluster (from Cell Ranger output)
+#   2. Merge peak annotations with gene annotations
+#   3. Match genes with known embryonic brain marker genes
+#   4. Assign cell types to clusters based on marker enrichment
+
+
+###############################################################################
+# Step 5: Identify Open Chromatin in UTR Regions
+###############################################################################
+
+# Extract 5' and 3' UTR regions from GTF annotation
+
+grep "five_prime_utr" Gallus_gallus.gtf | \
+awk -v OFS="\t" '{print $1, $4, $5, $10}' | \
+sed 's/"//g' | sed 's/;//g' > chick_5utr.bed
+
+grep "three_prime_utr" Gallus_gallus.gtf | \
+awk -v OFS="\t" '{print $1, $4, $5, $10}' | \
+sed 's/"//g' | sed 's/;//g' > chick_3utr.bed
+
+
+###############################################################################
+# Step 6: Extract UTR Sequences
+###############################################################################
+
+module load bedtools2
+
+bedtools getfasta -fi chicken_genome.fa \
+  -bed chick_5utr.bed -name > chick_5utr_sequences.fa
+
+bedtools getfasta -fi chicken_genome.fa \
+  -bed chick_3utr.bed -name > chick_3utr_sequences.fa
+
+
+###############################################################################
+# Step 7: Identify ATAC Peaks Overlapping UTR Regions
+###############################################################################
+
+# Identify peaks overlapping ≥50% of UTR length
+bedtools intersect \
+  -a sorted_chick_5utr.bed \
+  -b sorted_chick_peaks.bed \
+  -f 0.5 -r -wa -wb \
+  > chick_5utr_ATAC_overlap.bed
+
+# Extract peak identifiers
+awk '{print $5":"$6"-"$7}' chick_5utr_ATAC_overlap.bed \
+> chick_5utr_ATAC_peaks.txt
+
+
+###############################################################################
+# Step 8: Extract Peak Sequences
+###############################################################################
+
+# Extract peak sequences using grep (based on peak IDs)
+grep -wf chick_5utr_ATAC_peaks.txt -A 1 \
+chicken_all_peaks_sequences.fa \
+> chick_5utr_peak_sequences.fa
+
+
+###############################################################################
+# Step 9: Identify Small ORFs (uORFs/dORFs)
+###############################################################################
+
+module load dsorf
+
+python DsORF_init.py \
+  chick_5utr_peak_sequences.fa \
+  output_chick_5utr/ \
+  4 1 8 N conf/sORFconfig.cfg 0
+
+# Filter ORFs based on confidence score (>0.5)
+awk '$2 > 0.5 {print $4}' chick_5utr_dsorf | \
+sed 's/_//g' > chick_5utr_filtered_ids.txt
+
+
+###############################################################################
+# Step 10: ORF Prediction and Peptide Extraction
+###############################################################################
+
+module load orfipy
+
+orfipy chick_5utr_peak_sequences.fa \
+  --min 30 --max 300 \
+  --start ATG --stop TAG \
+  --pep chick_5utr_ORFs_AA
+
+
+###############################################################################
+# Step 11: Functional Annotation Using BLAST
+###############################################################################
+
+# Download curated protein database (UniProt Swiss-Prot)
+wget https://ftp.uniprot.org/pub/databases/uniprot/current_release/knowledgebase/complete/uniprot_sprot.fasta.gz
+
+# Perform BLAST search (short peptide alignment)
+blastp -query chick_5utr_ORFs_AA \
+  -db uniprot_sprot \
+  -task blastp-short \
+  -out chick_5utr_blast \
+  -outfmt 6 \
+  -evalue 1000
+
+# Filter significant hits
+awk '$4 > 20 && $5 < 3 && $6 < 3' chick_5utr_blast | \
+awk '{print $1}' | awk -F"_" '{print $1}' | uniq \
+> chick_5utr_coding_peaks.txt
+
+
+###############################################################################
+# Step 12: Associate Peaks with Genes
+###############################################################################
+
+# Map peaks to genes using annotation file
+awk 'NR==FNR{a[$1]=$2; next} $1 in a {print $0, a[$1]}' \
+chicken_peak_annotation.tsv \
+chick_5utr_coding_peaks.txt \
+> chick_5utr_peak_gene_associations.txt
+
+
+###############################################################################
+# Step 13: Cross-Species Comparative Analysis
+###############################################################################
+
+# Identify conserved genes between chicken and turkey
+comm -12 \
+<(awk '{print $2}' chick_5utr_peak_gene_associations.txt | sort) \
+<(awk '{print $2}' turkey_5utr_peak_gene_associations.txt | sort) \
+> conserved_5utr_genes.txt
+
+
+###############################################################################
+# Step 14: Evolutionary Conservation of Peaks
+###############################################################################
+
+module load blast
+
+# Build BLAST database
+makeblastdb -in chicken_all_peaks_sequences.fa \
+  -dbtype nucl -out chickDB
+
+# Align turkey peaks against chicken genome
+blastn -query turkey_all_peaks_sequences.fa \
+  -db chickDB \
+  -out turkey_vs_chicken.blast \
+  -outfmt 6 \
+  -evalue 1e-5
+
+# Identify highly conserved peaks
+awk '$3 > 95 && $4 > 200 && $5 < 3 && $6 < 3' \
+turkey_vs_chicken.blast \
+> conserved_peaks.txt
+
+
+###############################################################################
+# Step 15: Motif Enrichment Analysis
+###############################################################################
+
+module load homer
+
+# Perform motif enrichment on conserved peaks
+findMotifs.pl conserved_peaks.fa fasta \
+output_motifs/ \
+-fastaBg chicken_all_peaks_sequences.fa
+
+
+###############################################################################
+# Notes:
+# This pipeline identifies regulatory elements and genes involved in
+# embryonic brain development, including processes such as:
+#   - Neural progenitor proliferation
+#   - Neuronal differentiation
+#   - Synaptic maturation
+#
+# Example genes identified:
+#   DLGAP5, GABRA3, GRPR, KCNAB1, ST8SIA5, ATP6V1B2,
+#   CASKIN2, CSRP1, STK36, WDFY2
+#
+###############################################################################

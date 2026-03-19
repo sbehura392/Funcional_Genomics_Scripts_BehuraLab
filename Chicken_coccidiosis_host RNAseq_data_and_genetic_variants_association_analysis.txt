@@ -1,0 +1,170 @@
+# =============================================================================
+# Pipeline: RNA-seq Processing and Genetic Variant Association Analysis
+# Author: Susanta Behura
+#
+# Description:
+# This pipeline processes RNA-seq data from chicken gut samples to:
+# 1) Identify differentially expressed genes between coccidiosis-resistant
+#    and susceptible chickens
+# 2) Detect genetic variants (SNPs) from RNA-seq data
+# 3) Test association of variants with resistance/susceptibility traits
+#
+# Requirements:
+# - HISAT2
+# - featureCounts (Subread)
+# - sambamba
+# - samtools
+# - picard
+# - bcftools
+# - tabix
+#
+# Input:
+# - Paired-end RNA-seq FASTQ files (*_1.fastq.gz, *_2.fastq.gz)
+# - Reference genome index (HISAT2)
+# - Gene annotation file (GTF)
+#
+# Output:
+# - Gene-level read counts
+# - Variant call files (VCF)
+# - Trait-associated SNPs (BED format)
+# =============================================================================
+
+
+# =============================================================================
+# STEP 1: Read Alignment using HISAT2
+# =============================================================================
+
+module load hisat2
+
+# Align paired-end reads to the reference genome
+for f in $(ls *_1.fastq.gz | sed 's/_1.fastq.gz//g'); do
+    hisat2 -x hisat2_genome_index \
+           -1 ${f}_1.fastq.gz \
+           -2 ${f}_2.fastq.gz \
+           -S ${f}.sam
+done
+
+
+# =============================================================================
+# STEP 2: Gene Expression Quantification
+# =============================================================================
+
+# Count reads mapped to genomic features (exons grouped by gene_id)
+featureCounts -T 8 -p -t exon -g gene_id \
+    -a chicken_genes.gtf \
+    -o hisat2_readcounts.txt \
+    *.sam
+
+
+# =============================================================================
+# STEP 3: Convert SAM to BAM, Sort, and Mark Duplicates
+# =============================================================================
+
+module load picard
+module load sambamba
+module load samtools
+
+# Convert SAM to BAM
+for f in $(ls *.sam | sed 's/.sam//g'); do
+    sambamba view -S -f bam -t 12 ${f}.sam -o ${f}.bam
+done
+
+# Sort BAM files
+for f in $(ls *.bam | sed 's/.bam//g'); do
+    sambamba sort -t 12 ${f}.bam -o ${f}.sorted.bam
+done
+
+# Mark PCR duplicates
+for f in $(ls *.sorted.bam | sed 's/.sorted.bam//g'); do
+    picard MarkDuplicates \
+        I=${f}.sorted.bam \
+        O=${f}.dedup.bam \
+        M=${f}.dedup.metrics.txt
+done
+
+# Index BAM files
+for f in $(ls *.dedup.bam); do
+    sambamba index -t 12 ${f}
+done
+
+
+# =============================================================================
+# STEP 4: Variant Calling from RNA-seq Data
+# =============================================================================
+
+module load bcftools
+
+# Call SNPs and small variants
+for f in $(ls *.dedup.bam | sed 's/.dedup.bam//g'); do
+    bcftools mpileup -f genome.fa --annotate FORMAT/AD ${f}.dedup.bam | \
+    bcftools call -mv -O z -o ${f}_variants.vcf.gz
+done
+
+
+# =============================================================================
+# STEP 5: Merge Variant Files Across Samples
+# =============================================================================
+
+# Index individual VCF files
+for i in $(ls *_variants.vcf.gz | sed 's/_variants.vcf.gz//g'); do
+    tabix -p vcf ${i}_variants.vcf.gz
+done
+
+# Merge all VCFs into a combined dataset
+bcftools merge -m none -Oz -o merged_common.vcf.gz *.vcf.gz
+
+
+# =============================================================================
+# STEP 6: Rename Samples for Clarity
+# =============================================================================
+
+# Replace accession/sample IDs with meaningful names
+bcftools reheader -s samples_actual_names.txt \
+    merged_common.vcf.gz > renamed.vcf.gz
+
+
+# =============================================================================
+# STEP 7: Define Experimental Groups
+# =============================================================================
+
+# Extract sample names and assign to phenotype groups
+bcftools query -l renamed.vcf.gz | grep "JS" > susceptible.txt
+bcftools query -l renamed.vcf.gz | grep "JR" > resistant.txt
+
+
+# =============================================================================
+# STEP 8: Association Analysis of Genetic Variants
+# =============================================================================
+
+# Perform allele frequency contrast between groups
+bcftools +contrast \
+    -0 susceptible.txt \
+    -1 resistant.txt \
+    renamed.vcf.gz \
+    -o association_results.vcf.gz \
+    -Oz
+
+
+# =============================================================================
+# STEP 9: Extract Trait-Associated SNPs
+# =============================================================================
+
+# Filter SNPs with strong association signal
+zgrep -v "^##" association_results.vcf.gz | \
+    grep "PASSOC=0.0" > association_snps.txt
+
+# Convert SNPs to BED format for downstream analysis
+awk -v OFS="\t" '{
+    print $1, $2, $2, $1":"$2"_"$4"/"$5
+}' association_snps.txt | \
+    sort -k1,1 -k2,2n > trait_associated_SNPs.bed
+
+
+# =============================================================================
+# NOTES:
+# =============================================================================
+# - PASSOC=0.0 indicates strong allele frequency differences between groups
+# - RNA-seq variant calling may be biased toward expressed regions
+# - Consider additional filtering (depth, quality) for robust results
+# - Downstream integration with differential expression results is recommended
+# =============================================================================

@@ -1,0 +1,199 @@
+# =============================================================================
+# Pipeline: Integrated Analysis of Gut Microbiome and Bursa Immune Response
+# Author: Susanta Behura
+# Description:
+# This script performs differential abundance analysis of bacterial species,
+# differential gene expression analysis of host genes, visualization, and
+# causal mediation analysis to investigate microbiome-mediated immune responses
+# in chicken gut and bursa of Fabricius samples.
+# =============================================================================
+
+# Load required libraries
+library(infer)
+library(dplyr)
+library(edgeR)
+library(gplots)
+library(RColorBrewer)
+library(ggfortify)
+library(ggplot2)
+library(ggrepel)
+
+# =============================================================================
+# SECTION 1: Load and analyze bacterial count data
+# =============================================================================
+
+# Load bacterial species-level read count data
+b <- read.csv("Jejunm_caecum_bursa_lacto-bivido_baceria_species_level_readcount_HISAT2_data.csv",
+              row.names = 1)
+
+# Define sample groups (1 = gut, 2 = bursa)
+group <- as.factor(c(rep(1,7), rep(2,9)))
+
+# Perform differential abundance analysis using edgeR
+design <- model.matrix(~group)
+y <- DGEList(counts = b[,1:16])
+y <- calcNormFactors(y)
+y <- estimateGLMRobustDisp(y, design)
+y <- estimateGLMTrendedDisp(y, design)
+y <- estimateGLMTagwiseDisp(y, design)
+
+fit <- glmFit(y, design, robust = TRUE)
+lrt <- glmLRT(fit, coef = 2)
+
+# Extract results
+top <- topTags(lrt, nrow(b[,1:16]))
+res <- as.data.frame(top)
+
+# Classify differential abundance
+res <- transform(res,
+                 DE = ifelse(FDR < 0.001 & logFC > 2, "UP",
+                      ifelse(FDR < 0.001 & logFC < -2, "DOWN", "NOT_SIGNIFICANT")))
+
+# Save results
+write.csv(res, "diff_bacteria_in_Bursa_relative_to_gut.csv")
+
+# =============================================================================
+# SECTION 2: Volcano plot visualization
+# =============================================================================
+
+# Label differentially abundant bacteria
+res$diffexpressed <- "NO"
+res$diffexpressed[res$logFC > 0.6 & res$FDR < 0.05] <- "UP"
+res$diffexpressed[res$logFC < -0.6 & res$FDR < 0.05] <- "DOWN"
+
+# Select top 10 upregulated and downregulated taxa
+top10_up <- res %>% filter(diffexpressed == "UP") %>% arrange(FDR) %>% head(10)
+top10_down <- res %>% filter(diffexpressed == "DOWN") %>% arrange(FDR) %>% head(10)
+top_genes <- rbind(top10_up, top10_down)
+
+# Generate volcano plot
+ggplot(data = res, aes(x = logFC, y = -log10(FDR), col = diffexpressed)) +
+  geom_point(alpha = 0.4, size = 1.5) +
+  geom_text_repel(data = top_genes,
+                  aes(label = row.names(top_genes)),
+                  color = "black", size = 3) +
+  theme_minimal() +
+  labs(title = "Differentially Abundant Bacteria") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+        legend.position = "none") +
+  scale_color_manual(values = c("blue", "gray", "red"))
+
+# =============================================================================
+# SECTION 3: Microbial network analysis (Mutual Information)
+# =============================================================================
+
+# Construct mutual information network (requires 'minet' and 'GGally')
+# NOTE: Ensure object 'd' is defined appropriately before running
+ggnet2(minet(build.mim(t(d[,1:16]))),
+       size = 0,
+       edge.size = 0.09,
+       edge.color = "gray",
+       label.color = d$col,
+       label = TRUE,
+       mode = "circle",
+       layout.exp = 0.5) +
+  theme(plot.margin = margin(10, 10, 10, 10, "pt"))
+
+# =============================================================================
+# SECTION 4: Load and analyze host gene expression data
+# =============================================================================
+
+# Load host gene expression data
+g <- read.csv("host_genes_jejuncaecumBursa_expression.csv", row.names = 1)
+
+# Visualize expression patterns
+heatmap(as.matrix(g), margins = c(9,9))
+
+# Differential expression analysis
+group <- as.factor(c(rep(1,7), rep(2,9)))
+design <- model.matrix(~group)
+
+y <- DGEList(counts = g[,1:16])
+y <- calcNormFactors(y)
+y <- estimateGLMRobustDisp(y, design)
+y <- estimateGLMTrendedDisp(y, design)
+y <- estimateGLMTagwiseDisp(y, design)
+
+fit <- glmFit(y, design, robust = TRUE)
+lrt <- glmLRT(fit, coef = 2)
+
+top <- topTags(lrt, nrow(g[,1:16]))
+res <- as.data.frame(top)
+
+res <- transform(res,
+                 DE = ifelse(FDR < 0.001 & logFC > 2, "UP",
+                      ifelse(FDR < 0.001 & logFC < -2, "DOWN", "NOT_SIGNIFICANT")))
+
+write.csv(res, "diff_hostgenes_in_Bursa_relative_to_gut.csv")
+
+# =============================================================================
+# SECTION 5: Functional gene subset (B-cell activation)
+# =============================================================================
+
+# NOTE:
+# 'g1' should contain genes enriched for B-cell activation, proliferation,
+# and differentiation (derived from GO or pathway analysis)
+
+write.csv(g1, "Bcell_activation_proliferation_differentiation_upregulated_genes.csv")
+
+# =============================================================================
+# SECTION 6: Resampling and data integration
+# =============================================================================
+
+# Subsample genes and bacteria (1000 bootstrap replicates)
+g1000 <- as.data.frame(bg[1:26,] %>% rep_sample_n(size = 10, reps = 1000, replace = FALSE))
+b1000 <- as.data.frame(bg[27:41,] %>% rep_sample_n(size = 10, reps = 1000, replace = FALSE))
+
+# Combine datasets
+gb1000 <- cbind(g1000, b1000)
+
+# Compute aggregated signals
+gut <- rowSums(gb1000[,2:8])   # Gut expression
+bf  <- rowSums(gb1000[,9:17])  # Bursa expression
+
+# Compute bacterial shift (bursa vs gut)
+bact_shift <- rowSums(gb1000[,26:34]) / rowSums(gb1000[,19:25])
+
+# Create mediation dataset
+med_data <- data.frame(gut, bf, bact_shift)
+
+# =============================================================================
+# SECTION 7: Causal mediation analysis
+# =============================================================================
+
+# Predictor: gut gene expression
+# Mediator: bacterial shift
+# Outcome: bursa gene expression
+
+# Mediator model (M ~ X)
+med_model <- lm(bact_shift ~ gut, data = med_data)
+
+# Outcome model (Y ~ X + M)
+out_model <- lm(bf ~ gut + bact_shift, data = med_data)
+
+# Perform mediation analysis using bootstrap
+mediation_results <- mediate(med_model,
+                            out_model,
+                            treat = "gut",
+                            mediator = "bact_shift",
+                            boot = TRUE,
+                            sims = 1000)
+
+# View results
+summary(mediation_results)
+
+# =============================================================================
+# Interpretation Guide:
+# =============================================================================
+# ACME (Average Causal Mediation Effect):
+#   Measures indirect effect via microbiome mediator.
+#
+# ADE (Average Direct Effect):
+#   Direct effect of gut expression on bursa expression.
+#
+# Total Effect:
+#   Combined direct + indirect effects.
+#
+# Proportion Mediated:
+#   Fraction of total effect explained by microbiome mediation.
+# =============================================================================

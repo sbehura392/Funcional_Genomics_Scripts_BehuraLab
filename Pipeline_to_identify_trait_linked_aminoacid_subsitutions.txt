@@ -1,0 +1,284 @@
+# =============================================================================
+# Pipeline: Identification of Trait-Associated Amino Acid Substitutions
+# Author: Susanta Behura
+#
+# Description:
+# This pipeline analyzes protein sequences across multiple species to identify
+# amino acid substitutions associated with phenotypic traits such as:
+#   - Mammary gland location (thoracic vs non-thoracic)
+#   - Litter size (litter-bearing vs non-litter-bearing species)
+#
+# The workflow includes:
+#   1) Preprocessing protein FASTA files
+#   2) Extracting longest isoform per gene
+#   3) Identifying orthologous proteins shared across species
+#   4) Multiple sequence alignment (Clustal Omega)
+#   5) Group-based sequence comparison
+#   6) Detection of fixed and nearly fixed amino acid substitutions
+#
+# Reference:
+# Behura A et al. (2026) BioRxiv
+# https://doi.org/10.64898/2026.01.25.701627
+#
+# Requirements:
+# - awk, sed, sort
+# - Clustal Omega (clustalo)
+#
+# Input:
+# - Protein FASTA files (*.fa) from multiple species (e.g., Ensembl)
+#
+# Output:
+# - Aligned protein sequences
+# - Amino acid substitution counts per group
+# - Trait-associated substitution sites
+# =============================================================================
+
+
+# =============================================================================
+# STEP 1: Simplify FASTA Headers (retain gene symbol only)
+# =============================================================================
+
+for i in *.fa; do
+    sed 's/^.*gene_symbol:/>/' "$i" | awk '{print $1}' > "${i}_gene_symbol.fasta"
+done
+
+
+# =============================================================================
+# STEP 2: Convert Multi-line FASTA to Single-line FASTA
+# =============================================================================
+
+for i in *_gene_symbol.fasta; do
+    awk '{
+        if (NR==1) print $0;
+        else if ($0 ~ /^>/) print "\n"$0;
+        else printf $0
+    }' "$i" > "${i}_singleline.fasta"
+done
+
+
+# =============================================================================
+# STEP 3: Convert FASTA to Tabular Format (gene_id, sequence)
+# =============================================================================
+
+for i in *_singleline.fasta; do
+    awk -v OFS="\t" 'BEGIN{RS=">"} {
+        gsub("\n","\t",$0);
+        gsub(">","",$0);
+        print $0
+    }' "$i" > "${i}_table.txt"
+done
+
+
+# =============================================================================
+# STEP 4: Extract Longest Protein Isoform per Gene
+# =============================================================================
+
+for i in *_table.txt; do
+    awk '{print $1, $2, length($2)}' "$i" | \
+        sort -k1,1 -k3,3nr | \
+        sort -u -k1,1 | \
+        awk -v OFS='\t' '{print $1, $2}' > "${i}_longest.txt"
+done
+
+
+# =============================================================================
+# STEP 5: Combine All Species Data
+# =============================================================================
+
+awk '{print $0, FILENAME}' *_longest.txt | \
+    sed 's/_gene_symbol.fasta_singleline.fasta_table.txt_longest.txt//g' \
+    > all_longest_protein_sequences
+
+
+# =============================================================================
+# STEP 6: Identify Orthologous Proteins Shared Across All Species
+# =============================================================================
+
+# Retain genes present in all 18 species
+awk 'NR==FNR {count[$1]++; next} count[$1]==18' \
+    all_longest_protein_sequences \
+    all_longest_protein_sequences \
+    > common_gene_sequences
+
+
+# =============================================================================
+# STEP 7: Create FASTA Files for Each Gene (Across Species)
+# =============================================================================
+
+for gene in $(awk '{print $NF}' common_gene_sequences | sort | uniq); do
+    grep -w "$gene" common_gene_sequences | \
+    awk -v OFS='\n' '{print ">"$1"_"$4, $2}' \
+    > "species18_${gene}.fasta"
+done
+
+
+# =============================================================================
+# STEP 8: Multiple Sequence Alignment (Clustal Omega)
+# =============================================================================
+
+for i in species18_*.fasta; do
+    clustalo -i "$i" -o "aln_$i" --force --threads=4
+done
+
+
+# =============================================================================
+# STEP 9: Convert Alignments to Tabular Format
+# =============================================================================
+
+for i in aln_species18_*.fasta; do
+    awk '{
+        if (NR==1) print $0;
+        else if ($0 ~ /^>/) print "\n"$0;
+        else printf $0
+    }' "$i" > "${i}_singleline.fasta"
+done
+
+for i in *_singleline.fasta; do
+    awk '/^>/ {printf "%s\t", substr($0,2)} !/^>/ {print $0}' "$i" \
+        > "${i}_table.txt"
+done
+
+
+# =============================================================================
+# STEP 10: Combine All Alignments
+# =============================================================================
+
+awk '{print $0, FILENAME}' *_table.txt | \
+    sed 's/aln_species18_//g' | \
+    sed 's/_singleline.fasta_table.txt//g' \
+    > ALL_ALN_TABLE
+
+
+# =============================================================================
+# STEP 11: Define Phenotypic Groups
+# =============================================================================
+
+# Litter-bearing species
+grep -E 'Dog|Cat|Mouse|Ferret|Rabbit|Rat|Squirrel|Pig|Fox' ALL_ALN_TABLE > litter
+
+# Non-litter-bearing species
+grep -E 'Cow|Whale|Horse|Gorilla|Human|Elephant|Gibbon|Chimpanzee|Orangutan' ALL_ALN_TABLE > nonlitter
+
+# Thoracic mammary glands
+grep -E 'Gorilla|Human|Elephant|Gibbon|Chimpanzee|Orangutan' ALL_ALN_TABLE > thoracic
+
+# Non-thoracic mammary glands
+grep -E 'Cow|Dog|Whale|Horse|Cat|Mouse|Ferret|Rabbit|Rat|Squirrel|Pig|Fox' ALL_ALN_TABLE > nonthoracic
+
+
+# =============================================================================
+# STEP 12: Count Amino Acid Frequencies at Each Alignment Position
+# =============================================================================
+
+awk '{
+    gene=$4; seq=$3;
+    for(i=1;i<=length(seq);i++){
+        aa=substr(seq,i,1);
+        counts[gene,i,aa]++
+    }
+}
+END {
+    for(key in counts){
+        split(key,a,SUBSEP);
+        print a[1],a[2],a[3],counts[key]
+    }
+}' litter > counts_L
+
+awk '{
+    gene=$4; seq=$3;
+    for(i=1;i<=length(seq);i++){
+        aa=substr(seq,i,1);
+        counts[gene,i,aa]++
+    }
+}
+END {
+    for(key in counts){
+        split(key,a,SUBSEP);
+        print a[1],a[2],a[3],counts[key]
+    }
+}' nonlitter > counts_NL
+
+awk '{
+    gene=$4; seq=$3;
+    for(i=1;i<=length(seq);i++){
+        aa=substr(seq,i,1);
+        counts[gene,i,aa]++
+    }
+}
+END {
+    for(key in counts){
+        split(key,a,SUBSEP);
+        print a[1],a[2],a[3],counts[key]
+    }
+}' thoracic > counts_T
+
+awk '{
+    gene=$4; seq=$3;
+    for(i=1;i<=length(seq);i++){
+        aa=substr(seq,i,1);
+        counts[gene,i,aa]++
+    }
+}
+END {
+    for(key in counts){
+        split(key,a,SUBSEP);
+        print a[1],a[2],a[3],counts[key]
+    }
+}' nonthoracic > counts_NT
+
+
+# =============================================================================
+# STEP 13: Identify Fixed and Nearly Fixed Amino Acid Substitutions
+# =============================================================================
+
+# Fully conserved sites within groups
+awk '$4==9' counts_L  > counts9_L
+awk '$4==9' counts_NL > counts9_NL
+awk '$4==6' counts_T  > counts6_T
+awk '$4==6' counts_NT > counts6_NT
+
+# Nearly fixed sites
+awk '$4==8' counts_L  > counts8_L
+awk '$4==8' counts_NL > counts8_NL
+awk '$4==5' counts_T  > counts5_T
+awk '$4==5' counts_NT > counts5_NT
+
+
+# Compare between groups to identify trait-associated substitutions
+
+awk 'NR==FNR {a[$1,$2]=$0; next}
+     ($1,$2) in a {print a[$1,$2], $0}' counts9_L counts9_NL | \
+     awk '$3!=$7' > fixed_all_L_vs_NL
+
+awk 'NR==FNR {a[$1,$2]=$0; next}
+     ($1,$2) in a {print a[$1,$2], $0}' counts9_L counts8_NL | \
+     awk '$3!=$7' > fixed_all_L_most_NL
+
+awk 'NR==FNR {a[$1,$2]=$0; next}
+     ($1,$2) in a {print a[$1,$2], $0}' counts8_L counts9_NL | \
+     awk '$3!=$7' > fixed_most_L_all_NL
+
+
+# Thoracic vs non-thoracic comparisons
+
+awk 'NR==FNR {a[$1,$2]=$0; next}
+     ($1,$2) in a {print a[$1,$2], $0}' counts6_T counts6_NT | \
+     awk '$3!=$7' > fixed_all_T_vs_NT
+
+awk 'NR==FNR {a[$1,$2]=$0; next}
+     ($1,$2) in a {print a[$1,$2], $0}' counts6_T counts5_NT | \
+     awk '$3!=$7' > fixed_all_T_most_NT
+
+awk 'NR==FNR {a[$1,$2]=$0; next}
+     ($1,$2) in a {print a[$1,$2], $0}' counts5_T counts6_NT | \
+     awk '$3!=$7' > fixed_most_T_all_NT
+
+
+# =============================================================================
+# NOTES:
+# =============================================================================
+# - “Fixed” = same amino acid across all species in a group
+# - “Nearly fixed” = present in all but one species
+# - Results identify candidate residues linked to evolutionary traits
+# - Further validation (e.g., structural/functional analysis) is recommended
+# =============================================================================

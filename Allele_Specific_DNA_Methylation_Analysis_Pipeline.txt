@@ -1,0 +1,170 @@
+###############################################################################
+# DNA Methylation Analysis Pipeline for Allele-Specific Methylation (ASM)
+#
+# Description:
+# This pipeline processes whole-genome bisulfite sequencing (WGBS) data to
+# identify allele-specific DNA methylation (ASM) patterns.
+#
+# The workflow includes:
+#   - Alignment of bisulfite sequencing reads using BISCUIT
+#   - Duplicate removal and BAM processing
+#   - Methylation and SNP extraction
+#   - Epiread construction
+#   - Detection of allele-specific methylation events
+#
+# Requirements:
+#   - BISCUIT
+#   - samtools
+#   - dupsifter
+#   - bgzip / tabix (htslib)
+#
+# Input:
+#   - Paired-end trimmed FASTQ files:
+#       *_L001_R1_001_trimmed.fastq.gz
+#       *_L001_R2_001_trimmed.fastq.gz
+#
+# Reference Genome:
+#   Mus musculus (GRCm39)
+#
+###############################################################################
+
+
+###############################################################################
+# Step 1: Load Required Modules
+###############################################################################
+
+module load samtools
+module load dupsifter
+module load biscuit
+
+
+###############################################################################
+# Step 2: Define Reference Genome
+###############################################################################
+
+genome="Mus_musculus.GRCm39.dna.primary_assembly.fa"
+
+
+###############################################################################
+# Step 3: Align Reads and Generate Sorted BAM Files
+###############################################################################
+
+# Align paired-end bisulfite sequencing reads using BISCUIT
+# Pipeline:
+#   alignment → duplicate removal → BAM sorting
+
+for f in $(ls *_L001_R1_001_trimmed.fastq.gz | \
+           sed 's/_L001_R1_001_trimmed.fastq.gz//g'); do
+
+  biscuit align -@ 8 ${genome} \
+    ${f}_L001_R1_001_trimmed.fastq.gz \
+    ${f}_L001_R2_001_trimmed.fastq.gz | \
+  dupsifter ${genome} | \
+  samtools sort -@ 8 -o ${f}.bam -O BAM -
+
+done
+
+
+###############################################################################
+# Step 4: Index BAM Files
+###############################################################################
+
+for f in $(ls *.bam | sed 's/.bam//g'); do
+  samtools index ${f}.bam
+done
+
+
+###############################################################################
+# Step 5: Generate VCF (Pileup of Methylation and SNPs)
+###############################################################################
+
+# Create pileup and call variants (VCF format)
+for f in $(ls *.bam | sed 's/.bam//g'); do
+  biscuit pileup -@ 8 -o ${f}.vcf ${genome} ${f}.bam
+done
+
+
+###############################################################################
+# Step 6: Compress and Index VCF Files
+###############################################################################
+
+# Compress VCF files
+for f in $(ls *.vcf | sed 's/.vcf//g'); do
+  bgzip -@ 8 ${f}.vcf
+done
+
+# Index compressed VCF files
+for f in $(ls *.vcf.gz | sed 's/.vcf.gz//g'); do
+  tabix -p vcf ${f}.vcf.gz
+done
+
+
+###############################################################################
+# Step 7: Extract Methylation and SNP Sites
+###############################################################################
+
+# Extract CpG methylation sites
+for f in $(ls *.vcf.gz | sed 's/.vcf.gz//g'); do
+  biscuit vcf2bed -t cg ${f}.vcf.gz > ${f}.meth.bed
+done
+
+# Extract SNP sites
+for f in $(ls *.vcf.gz | sed 's/.vcf.gz//g'); do
+  biscuit vcf2bed -t snp ${f}.vcf.gz > ${f}.snp.bed
+done
+
+
+###############################################################################
+# Step 8: Construct Epireads
+###############################################################################
+
+# Epireads represent methylation patterns across reads
+for f in $(ls *.snp.bed | sed 's/.snp.bed//g'); do
+  biscuit epiread -@ 8 -B ${f}.snp.bed ${genome} ${f}.bam | \
+  sort -k1,1 -k2,2n > ${f}.epibed
+done
+
+
+###############################################################################
+# Step 9: Extract Allele-Specific Methylation Signals
+###############################################################################
+
+# Generate pairwise epiread information for ASM analysis
+for f in $(ls *.epibed | sed 's/.epibed//g'); do
+  biscuit epiread -@ 8 -P -B ${f}.snp.bed ${genome} ${f}.bam \
+  > ${f}.pairwise
+done
+
+
+###############################################################################
+# Step 10: Sort Pairwise Epiread Data
+###############################################################################
+
+for f in $(ls *.pairwise | sed 's/.pairwise//g'); do
+  sort -k1,1 -k2,2n -k3,3n ${f}.pairwise \
+  > ${f}.sorted.pairwise
+done
+
+
+###############################################################################
+# Step 11: Identify Allele-Specific Methylation (ASM)
+###############################################################################
+
+# Detect ASM regions using sorted pairwise epireads
+for f in $(ls *.sorted.pairwise | sed 's/.sorted.pairwise//g'); do
+  biscuit asm ${f}.sorted.pairwise > ${f}.asm
+done
+
+
+###############################################################################
+# Output Files:
+#
+#   *.bam                  → Aligned reads
+#   *.vcf.gz               → Variant + methylation calls
+#   *.meth.bed             → CpG methylation sites
+#   *.snp.bed              → SNP locations
+#   *.epibed               → Epiread methylation patterns
+#   *.pairwise             → Allele-specific methylation pairs
+#   *.asm                  → Final ASM regions
+#
+###############################################################################

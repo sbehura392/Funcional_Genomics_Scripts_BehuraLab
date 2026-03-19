@@ -1,0 +1,228 @@
+###############################################################################
+# Single-cell / Single-nucleus RNA-seq Cell Type Assignment Pipeline
+#
+# Description:
+# This integrated Bash + R pipeline performs cell type prediction from
+# single-cell (scRNA-seq) or single-nucleus (snRNA-seq) RNA sequencing data
+# using marker gene enrichment analysis.
+#
+# Unlike conventional annotation methods that rely on predefined marker genes
+# for specific tissues or species, this workflow implements a data-driven
+# approach. It uses Fisher’s Exact Test to quantify enrichment of known marker
+# genes within clusters, enabling objective and transferable cell type
+# assignment across datasets.
+#
+# Key Features:
+#   - Alignment and quantification using 10x Genomics Cell Ranger
+#   - Preprocessing, clustering, and visualization using Seurat (R)
+#   - Statistical enrichment-based cell type prediction
+#
+# References:
+#   1. Islam M, Samal A, Davis DJ, Behura SK. (2024)
+#      Ablation of placental REST deregulates fetal brain metabolism...
+#      FASEB J. 38(1):e23349.
+#   2. Islam M, Behura SK. (2023)
+#      Role of caveolin-1 in metabolic programming of fetal brain.
+#      iScience. 26(10):107710.
+#   3. Islam M, Behura SK. (2024)
+#      Single-Cell Transcriptional Response of the Placenta...
+#      Cells. 13(3):215.
+#
+###############################################################################
+
+
+###############################################################################
+# Step 1: Build Reference Genome Index and Map Reads (Cell Ranger)
+###############################################################################
+
+# Load Cell Ranger module (adjust based on system environment)
+module load cellranger
+
+# Build reference genome index
+# Inputs:
+#   genome.fa  : reference genome FASTA file
+#   genes.gtf  : gene annotation file
+cellranger mkref \
+  --genome=index \
+  --fasta=genome.fa \
+  --genes=genes.gtf \
+  --nthreads=4
+
+# Align sequencing reads and generate count matrix
+# NOTE:
+# FASTQ files must follow 10x Genomics naming convention:
+#   SampleName_S1_L001_R1_001.fastq.gz
+cellranger count \
+  --id=sample \
+  --transcriptome=index \
+  --fastqs=. \
+  --sample=sample
+
+# NOTE (snRNA-seq):
+# Include intronic reads, as nuclear RNA is not fully spliced.
+
+
+###############################################################################
+# Step 2: Load Data and Perform Preprocessing (Seurat)
+###############################################################################
+
+library(Seurat)
+
+# Load filtered count matrix from Cell Ranger output
+samp <- Read10X(data.dir = "filtered_feature_bc_matrix1/")
+
+# Create Seurat object
+samp <- CreateSeuratObject(counts = samp)
+
+# Compute mitochondrial gene percentage (QC metric)
+samp[["percent.mt"]] <- PercentageFeatureSet(samp, pattern = '^MT-')
+
+# Filter low-quality cells:
+#   - Retain cells with >500 detected genes
+#   - Remove cells with >5% mitochondrial content
+subset <- subset(samp, subset = nFeature_RNA > 500 & percent.mt < 5)
+
+# Normalize gene expression data
+norm <- NormalizeData(subset, verbose = FALSE)
+
+# Identify highly variable genes for downstream analysis
+vfeature <- FindVariableFeatures(norm,
+                                 selection.method = 'vst',
+                                 nfeatures = 2000)
+
+
+###############################################################################
+# Step 3: Dimensionality Reduction and Clustering
+###############################################################################
+
+# Perform principal component analysis (PCA)
+pca <- RunPCA(norm, npcs = 30, verbose = FALSE)
+
+# Generate UMAP embedding
+umap <- RunUMAP(pca, reduction = "pca", dims = 1:20)
+
+# Construct nearest-neighbor graph
+neighbor <- FindNeighbors(umap, reduction = "pca", dims = 1:20)
+
+# Perform clustering (resolution can be tuned)
+cluster <- FindClusters(neighbor, resolution = 0.5)
+
+# Optional: t-SNE visualization
+tsne <- RunTSNE(cluster)
+
+
+###############################################################################
+# Step 4: Identify Cluster-Specific Marker Genes
+###############################################################################
+
+# Detect differentially expressed genes per cluster
+markers <- FindAllMarkers(cluster,
+                          only.pos = TRUE,
+                          min.pct = 0.25,
+                          logfc.threshold = 0.25)
+
+# Retain statistically significant markers (adjusted p-value < 0.05)
+markers_filtered <- subset(markers, p_val_adj < 0.05)[, -1]
+
+
+###############################################################################
+# Step 5: Load Reference Cell-Type Marker Database
+###############################################################################
+
+# Load curated marker gene dataset
+# Sources may include PanglaoDB, CellPedia, or literature-derived datasets
+bm <- read.csv("known_cell_markers.csv")
+
+# Example filtering (customize based on tissue/species context)
+bm_filtered <- subset(bm, present.in.adult.brain.mouse == '1')
+
+# Standardize column naming for merging
+colnames(bm_filtered)[1] <- "gene"
+
+
+###############################################################################
+# Step 6: Marker Enrichment Analysis
+###############################################################################
+
+# Merge cluster markers with reference marker genes
+merged_markers <- merge(bm_filtered, markers_filtered, by = "gene")
+
+# Create contingency table: Cell Type vs Cluster
+tab1 <- data.frame(table(merged_markers$abbr,
+                         merged_markers$cluster))
+colnames(tab1) <- c("Celltype", "Cluster", "Cell_count")
+
+# Compute marginal totals
+cellcounts_per_Celltype <- aggregate(Cell_count ~ Celltype, tab1, sum)
+cellcounts_per_Cluster <- aggregate(Cell_count ~ Cluster, tab1, sum)
+
+# Merge contingency table with totals
+tab1merge <- merge(tab1, cellcounts_per_Celltype, by = "Celltype")
+tab1merge <- merge(tab1merge, cellcounts_per_Cluster, by = "Cluster")
+
+# Total observations
+tab1merge$total <- sum(tab1merge$Cell_count.x)
+
+# Prepare input for statistical testing
+test_df <- tab1merge[, c(3:6)]
+
+
+###############################################################################
+# Step 7: Fisher’s Exact Test for Cell Type Enrichment
+###############################################################################
+
+# Define function to perform Fisher’s Exact Test
+row_fisher <- function(row,
+                       alt = 'greater',
+                       cnf = 0.95) {
+  f <- fisher.test(matrix(row, nrow = 2),
+                   alternative = alt,
+                   conf.level = cnf)
+  return(c(row,
+           p_val = f$p.value,
+           or = f$estimate[[1]],
+           or_ll = f$conf.int[1],
+           or_ul = f$conf.int[2]))
+}
+
+# Apply Fisher’s test across all rows
+p <- data.frame(t(apply(test_df, 1, row_fisher)))
+
+# Store p-values
+tab1merge$p_val <- p$p_val
+
+
+###############################################################################
+# Step 8: Assign Cell Types to Clusters
+###############################################################################
+
+# Identify most significantly enriched cell type per cluster
+sig <- aggregate(p_val ~ Cluster, tab1merge, min)
+
+# Create matching identifiers
+sig$cl_p <- paste0(sig$Cluster, "_", sig$p_val)
+tab1merge$cl_p <- paste0(tab1merge$Cluster, "_", tab1merge$p_val)
+
+# Extract best-matching cell types
+celltypes <- subset(tab1merge, cl_p %in% sig$cl_p)
+
+# Format for Seurat identity assignment
+assign <- paste0("'", celltypes$Cluster, "'='", "'", celltypes$Celltype, "'")
+
+# Concatenate assignments
+cells <- paste(assign, collapse = ",")
+
+
+###############################################################################
+# Step 9: Visualization and Annotation
+###############################################################################
+
+# Assign identities using:
+#   RenameIdents(seurat_object, ...)
+
+# Visualize clusters:
+#   DimPlot(seurat_object, reduction = "umap", label = TRUE)
+
+###############################################################################
+# End of Pipeline
+###############################################################################

@@ -1,0 +1,266 @@
+# =============================================================================
+# Pipeline: Modeling Evolution of Paralog Gene Expression
+# Author: Susanta Behura
+#
+# Description:
+# This pipeline identifies paralog gene groups in mouse and integrates
+# sequence similarity, gene expression, and phylogenetic modeling to study
+# evolutionary divergence of paralog expression patterns.
+#
+# Workflow:
+#   1) Retrieve coding sequences (CDS)
+#   2) Extract longest isoform per gene
+#   3) Identify paralog gene groups (Ensembl BioMart)
+#   4) Integrate gene expression data
+#   5) Construct paralog groups (PGs)
+#   6) Perform sequence alignment and phylogenetic tree construction
+#   7) Run Bayesian evolutionary models (BayesTraits)
+#   8) Compare models using log Bayes factors
+#
+# Reference:
+# Islam M, Behura SK. (2024) Placenta 145:143–150
+#
+# Requirements:
+# - wget, awk, sed, sort
+# - clustalo
+# - phyx (pxnj, pxrr, pxt2nex)
+# - R (ape package)
+# - BayesTraitsV4
+#
+# Input:
+# - Ensembl CDS FASTA
+# - Gene expression dataset (expr_data)
+#
+# Output:
+# - Paralog groups with sequences and expression
+# - Phylogenetic trees
+# - Bayesian model results
+# - Log Bayes factor comparisons
+# =============================================================================
+
+
+# =============================================================================
+# STEP 1: Download Mouse CDS Sequences
+# =============================================================================
+
+wget https://ftp.ensembl.org/pub/current_fasta/mus_musculus/cds/Mus_musculus.GRCm39.cds.all.fa.gz
+gunzip Mus_musculus.GRCm39.cds.all.fa.gz
+
+
+# =============================================================================
+# STEP 2: Clean FASTA Headers
+# =============================================================================
+
+# Extract gene ID
+sed 's/^.*gene:/>/' Mus_musculus.GRCm39.cds.all.fa | sed 's/\..*$//' \
+    > CDS_geneID.fasta
+
+# Extract gene symbol
+sed 's/^.*gene_symbol:/>/' Mus_musculus.GRCm39.cds.all.fa | awk '{print $1}' \
+    > CDS_geneSymbol.fasta
+
+
+# =============================================================================
+# STEP 3: Convert FASTA to Single-Line Format
+# =============================================================================
+
+awk '{
+    if (NR==1) print $0;
+    else if ($0 ~ /^>/) print "\n"$0;
+    else printf $0
+}' CDS_geneSymbol.fasta > sequences_singleline.fasta
+
+
+# =============================================================================
+# STEP 4: Convert FASTA to Tabular Format
+# =============================================================================
+
+awk -v OFS="\t" 'BEGIN{RS=">"} {
+    gsub("\n","\t",$0);
+    gsub(">","",$0);
+    print $0
+}' sequences_singleline.fasta > gene_sequence_table
+
+
+# =============================================================================
+# STEP 5: Extract Longest CDS per Gene
+# =============================================================================
+
+awk '{print $1, $2, length($2)}' gene_sequence_table | \
+    sort -k1,1 -k3,3nr | \
+    sort -u -k1,1 | \
+    awk -v OFS='\t' '{print $1, $2}' > gene_sequences
+
+
+# =============================================================================
+# STEP 6: Download and Filter Paralog Data (BioMart)
+# =============================================================================
+
+wget -O paralogs.txt 'http://www.ensembl.org/biomart/...'
+
+# Filter paralogs with ≥25% identity
+awk -F'\t' '$2!="" && $4!="" && $7>25 && $8>25' paralogs.txt \
+    > paralogs_filtered
+
+# Remove redundancy in target genes
+awk -F'\t' '!seen[$4]++' paralogs_filtered > paralogs_NR
+
+
+# =============================================================================
+# STEP 7: Map CDS Sequences to Paralog Groups
+# =============================================================================
+
+awk -F'\t' 'NR==FNR {A[$1]=$2; next}
+    {seq=A[$4]; if(seq!="") print $4, $2"_paralogs", seq}' \
+    gene_sequences paralogs_NR > paralogs_seq
+
+
+# =============================================================================
+# STEP 8: Process Gene Expression Data
+# =============================================================================
+
+# Concatenate expression values across samples
+awk -F'\t' '{print $1, $2"_"$3"_"$4"_"$5}' expr_data \
+    > expr_data_concat
+
+# Map expression to paralog genes
+awk -F'\t' 'NR==FNR {A[$1]=$2; next}
+    {expr=A[$1]; if(expr!="") print $0, expr}' \
+    expr_data_concat paralogs_seq | sort -k2 > paralogs_seq_expr
+
+# Retain paralog groups with ≥5 genes
+awk -F'\t' 'NR==FNR {count[$2]++; next}
+    count[$2]>4' paralogs_seq_expr paralogs_seq_expr \
+    > paralogs_seq_expr_groups
+
+
+# =============================================================================
+# STEP 9: Assign Paralog Group IDs and Outgroup Genes
+# =============================================================================
+
+awk -F'\t' 'NR==FNR {A[$4]=$8; next}
+    {if(A[$1]!="") print $2, $1, A[$1]}' \
+    paralogs_filtered paralogs_seq_expr_groups | \
+    sort -k1,1 -k3,3 | sort -u -k1,1 | \
+    awk '{print $1, "PG"NR"_"$2}' \
+    > PGs_and_outgroup_gene
+
+
+# =============================================================================
+# STEP 10: Build Paralog Group Dataset
+# =============================================================================
+
+awk -F'\t' 'NR==FNR {A[$1]=$2; next}
+    {if(A[$2]!="") print A[$2], $1, $2, $3, $4}' \
+    PGs_and_outgroup_gene paralogs_seq_expr_groups \
+    > PGs_data
+
+
+# =============================================================================
+# STEP 11: Generate Sequence and Expression Files per PG
+# =============================================================================
+
+# Sequence files
+for pg in $(awk '{print $1}' PGs_data | sort | uniq); do
+    grep -w "$pg" PGs_data | \
+    awk '{print ">"$3"\n"$4}' > seq_$pg
+done
+
+# Expression files
+for pg in $(awk '{print $1}' PGs_data | sort | uniq); do
+    grep -w "$pg" PGs_data | \
+    awk '{print $3, $5}' > expr_$pg
+done
+
+
+# =============================================================================
+# STEP 12: Sequence Alignment and Phylogenetic Tree Construction
+# =============================================================================
+
+module load clustalo
+
+for i in seq_*; do
+    clustalo -i "$i" -o "aln_$i" --force
+done
+
+module load phyx
+
+for i in aln_*; do
+    pxnj -s "$i" -o "newick_$i"
+done
+
+
+# =============================================================================
+# STEP 13: Root Trees and Convert Formats
+# =============================================================================
+
+awk -F'\t' '{print $3, $2}' PGs_and_outgroup_gene > outgroups.txt
+
+for i in newick_*; do
+    gene=$(basename "$i")
+    root=$(grep "$gene" outgroups.txt | cut -f2)
+    pxrr -t "$i" -g "$root" -r -o "root_$i"
+done
+
+for i in root_newick_*; do
+    pxt2nex -t "$i" -o "nexus_$i"
+done
+
+
+# =============================================================================
+# STEP 14: Format Trees Using R (ape)
+# =============================================================================
+
+Rscript -e '
+library(ape)
+for (i in list.files(pattern="nexus_")) {
+    t <- read.nexus(i)
+    write.nexus(t, file=paste0("ape_", i))
+}
+'
+
+
+# =============================================================================
+# STEP 15: Run Bayesian Evolutionary Models (BayesTraits)
+# =============================================================================
+
+module load BayesTraitsV4
+
+# Example: Model A vs correlated model
+for i in expr_PG*; do
+    id=${i#expr_PG}
+    
+    echo -e "4\n2\nStones 100 1000\nRun" > modelA
+    BayesTraitsV4 ape_nexus_root_newick_aln_seq_PG$id $i < modelA
+
+    echo -e "4\n2\nTestCorrel\nStones 100 1000\nRun" > modelAcorr
+    BayesTraitsV4 ape_nexus_root_newick_aln_seq_PG$id $i < modelAcorr
+done
+
+
+# =============================================================================
+# STEP 16: Compute Log Bayes Factors
+# =============================================================================
+
+awk -F'\t' 'NR==FNR {A[$1]=$2; next}
+    {if(A[$1]!="") print $1, $2, A[$1], 2*($2-A[$1])}' \
+    all_mlm_values_modelAcorr all_mlm_values_modelA \
+    > LBF_modelA_vs_modelAcorr
+
+
+# =============================================================================
+# STEP 17: Identify Significant Paralog Groups
+# =============================================================================
+
+awk '$4 > 10 {print $0, "evidence"}' LBF_modelA_vs_modelAcorr \
+    > PGs_with_significant_correlation
+
+
+# =============================================================================
+# NOTES:
+# =============================================================================
+# - Log Bayes Factor >10 indicates strong evidence for trait correlation
+# - Outgroup selection is based on lowest sequence similarity
+# - Expression data can be subset for tissue- or sex-specific analyses
+# - Further downstream analyses may include network modeling or selection tests
+# =============================================================================
