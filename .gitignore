@@ -1,0 +1,32 @@
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.swp
+
+# Python
+__pycache__/
+*.pyc
+
+# R
+.Rhistory
+.RData
+
+# Large data files
+*.bam
+*.sam
+*.fastq
+*.fq
+*.vcf
+*.vcf.gz
+*.bed
+
+# Output folders
+results/
+output/
+tmp/
